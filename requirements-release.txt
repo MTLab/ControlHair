@@ -1,0 +1,7 @@
+huggingface-hub==0.36.2
+gdown==6.1.0
+deepspeed==0.16.3
+lightning==2.5.0.post0
+opencv-python==4.10.0.84
+pandas==2.2.3
+peft==0.14.0

@@ -1,0 +1,51 @@
+.vscode/
+.DS_Store
+/.venv/
+/.venv-release/
+/.venv-physics/
+/artifacts/
+/datasets/
+/models/
+/third_party/UniAnimate-DiT/
+/third_party/HairStep/
+/third_party/difflocks/
+
+# Python
+**/env/
+**/.venv/
+**/__pycache__/**
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Datasets and generated media
+**/input_videos/
+**/input_videos_*/
+**/private_videos/
+**/private_videos_*/
+**/simulation_sequences/
+**/frames/
+**/conditions/
+*.pkl
+
+# Models and experiment output
+**/checkpoints/
+**/models_out*/
+**/outputs*/
+**/runs/
+**/wandb/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+
+# Downloaded third-party applications
+**/blender-*/
+**/Wan2.1-I2V-*/

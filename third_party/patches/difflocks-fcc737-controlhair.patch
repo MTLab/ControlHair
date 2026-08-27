@@ -1,0 +1,1226 @@
+diff --git a/inference/img2hair.py b/inference/img2hair.py
+index 01da67ba5a2e103b3b6a47a89a31a36c0b37ecda..4602a4ceb102ed549d00a73a3ae8ca298da8d865 100644
+--- a/inference/img2hair.py
++++ b/inference/img2hair.py
+@@ -52,7 +52,7 @@ class Mediapipe():
+ 
+         base_options = python.BaseOptions(
+             model_asset_path=os.path.join(SCRIPT_DIR,'./assets/face_landmarker.task'),
+-            delegate=mp.tasks.BaseOptions.Delegate.GPU
++            delegate="CPU"
+             )
+         options = vision.FaceLandmarkerOptions(
+                                         running_mode=mode,
+@@ -195,14 +195,7 @@ def crop_face(image, face_landmarks, output_size, crop_size_multiplier=2.8):
+         value=(0, 0, 0)  # Black padding
+     )
+ 
+-    # Decide interpolation method based on whether we’re upscaling or downscaling
+-    h, w = padded_image.shape[:2]
+-    if h > output_size or w > output_size:
+-        interpolation = cv2.INTER_AREA  # downscaling
+-    else:
+-        interpolation = cv2.INTER_CUBIC  # upscaling
+-
+-    padded_image = cv2.resize(padded_image, (output_size, output_size), interpolation=interpolation)
++    padded_image = cv2.resize(padded_image, (output_size, output_size))
+ 
+     return padded_image
+ 
+@@ -393,7 +386,7 @@ class DiffLocksInference():
+         rgb_img = torch.tensor(frame).cuda()
+         rgb_img=rgb_img.permute(2,0,1).unsqueeze(0).float()/255.0
+ 
+-
++        # import ipdb; ipdb.set_trace()
+         strand_points_world, hair_material_dict = self.rgb2hair(rgb_img, out_path) 
+ 
+         return strand_points_world, hair_material_dict
+diff --git a/inference/npz2blender.py b/inference/npz2blender.py
+index 324da45f604e63ca41b6d820dc0a41d1876d0f56..89d33f6bd98b44f51e7f580c0a712d7b90c84b43 100644
+--- a/inference/npz2blender.py
++++ b/inference/npz2blender.py
+@@ -1,6 +1,6 @@
+-
+ #run with 
+ # ~/blender-4.1.1-linux-x64/blender  -t 8 --background --python ./inference/npz2blender.py -- --input_npz <NPZ_PATH> --out_path <OUTPUT_PATH> --export_alembic
++# Add --hair_dynamics to enable hair physics simulation
+ 
+ 
+ 
+@@ -15,7 +15,7 @@ import os
+ import numpy as np
+ # from gloss import *
+ # import trimesh
+-# import json
++import json
+ import argparse
+ import sys
+ # import imageio.v3 as iio
+@@ -29,81 +29,605 @@ import shutil
+ import time
+ 
+ 
++def setup_orbit_camera(center_xyz, n_frames, cam_name='Camera.001', clockwise=False, radius_factor=1.0):
++    scene = bpy.context.scene
+ 
+-path_cur_script=os.path.dirname(os.path.abspath(__file__))
++    # 取相机：用 Camera.001；不存在就报错更安全
++    cam = bpy.data.objects.get(cam_name)
++    if cam is None or cam.type != 'CAMERA':
++        raise RuntimeError(f"{cam_name} not found or not a CAMERA")
++
++    scene.camera = cam  # 设为活动相机
++
++    # 相机 z：用当前相机的 z（你的要求）
++    z = cam.location.z
+ 
+-def export_alembic(out_alembic_path, resolution):
+-    print("-------------------------------------------")
++    # 圆心与半径（半径来自当前相机与圆心的 XY 距离；太小则给默认 2.0）
++    cx, cy, cz = center_xyz
++    r = math.hypot(cam.location.x - cx, cam.location.y - cy)
++    if r < 1e-4:
++        r = 2.0
++        cam.location.x = cx + r
++        cam.location.y = cy
++        cam.location.z = z  # 保持当前 z
+     
+-    # bpy.ops.outliner.item_activate(deselect_all=True)
+-    bpy.data.objects["hair_01"].select_set(True)
+-    # hair = bpy.context.active_object
+-    hair = bpy.data.objects["hair_01"]
+-    bpy.context.view_layer.objects.active=hair
++    # Apply radius factor
++    r *= radius_factor
+ 
++    # 空物体作为跟踪目标：永远看向 scalp
++    target_name = "CamTarget_Scalp"
++    target = bpy.data.objects.get(target_name)
++    if target is None:
++        target = bpy.data.objects.new(target_name, None)
++        scene.collection.objects.link(target)
++    target.location = Vector((cx, cy, -5))
+ 
+-    start=time.time()
+-    for modif in hair.modifiers:
+-        print("applying",modif.name)
+-        bpy.context.view_layer.objects.active = hair
+-        bpy.ops.object.modifier_apply(modifier=modif.name)
+-    print("finished applying all geometry nodes")
+-    end=time.time()
+-    print("applying geometry nodes took", end-start)
+-    #shrinkwrap on the scalp (Wrong because it makes weird strands for the long hair)
+-    #default hair with t=8: 20s
+-    #default hair with t=16: 15s
+-    #50% strans with t=16: 6s
++    # 清理旧动画与约束，添加 Track To
++    if cam.animation_data:
++        cam.animation_data_clear()
++    for c in list(cam.constraints):
++        cam.constraints.remove(c)
++    c = cam.constraints.new(type='TRACK_TO')
++    c.target = target
++    c.track_axis = 'TRACK_NEGATIVE_Z'
++    c.up_axis = 'UP_Y'
++    
++    
++    
+ 
+-    #with shrinkwrap on the whole mesh
+-    #default hair with t=8: 43s
+-    #default hair with t=16: 34s
+-    #50% strans with t=16: 14s
+-    #50% strans, 50%points with t=16: 7s
+-    #50% strans, 25%points with t=16: 5s
++    # 计算初始角度：以scalp的-Y方向为起始参考
++    start_theta = -math.pi / 2  # -Y方向对应角度为-π/2
++    
++    # 帧区间；确保最后一帧角度=360°
++    n_frames = max(2, int(n_frames))
++    scene.frame_start = 1
++    scene.frame_end = n_frames
+ 
++    # 打关键帧：1..n_frames，从当前位置开始旋转360°
++    for f in range(1, n_frames + 1):
++        t = (f - 1) / (n_frames - 1)  # 0 → 1
++        theta = start_theta + 2.0 * math.pi * t
++        if clockwise:
++            theta = start_theta - 2.0 * math.pi * t
++        x = cx + r * math.cos(theta)
++        y = cy + r * math.sin(theta)
++        cam.location = Vector((x, y, z))
++        cam.keyframe_insert(data_path="location", frame=f)
+ 
++    bpy.context.view_layer.update()
+ 
+ 
+-    #conver particle
+-    bpy.ops.curves.convert_to_particle_system()
++def setup_fixed_camera(center_xyz, angle_deg, cam_name='Camera.001', radius_factor=1.0):
++    # """Fix camera at specific angle relative to initial camera position"""
++    scene = bpy.context.scene
++    
++    # Get camera
++    cam = bpy.data.objects.get(cam_name)
++    if cam is None or cam.type != 'CAMERA':
++        raise RuntimeError(f"{cam_name} not found or not a CAMERA")
++    
++    scene.camera = cam  # Set as active camera
++    
++    # Keep current camera z
++    z = cam.location.z
++    
++    # Get center and calculate radius from current camera position
++    cx, cy, cz = center_xyz
++    r = math.hypot(cam.location.x - cx, cam.location.y - cy)
++    if r < 1e-4:
++        r = 2.0
++    
++    # Apply radius factor
++    r *= radius_factor
++    
++    # Calculate initial angle: use scalp -Y direction as reference
++    initial_theta = -math.pi / 2  # -Y方向对应角度为-π/2
++    
++    # Convert degrees to radians and add to initial angle
++    target_theta = initial_theta + math.radians(angle_deg)
++    
++    # Set camera position at target angle
++    x = cx + r * math.cos(target_theta)
++    y = cy + r * math.sin(target_theta)
++    cam.location = Vector((x, y, z))
++    
++    # Set up tracking target to look at scalp
++    target_name = "CamTarget_Scalp"
++    target = bpy.data.objects.get(target_name)
++    if target is None:
++        target = bpy.data.objects.new(target_name, None)
++        scene.collection.objects.link(target)
++    target.location = Vector((cx, cy, -5))
++    
++    # Clear old animations and constraints, add Track To
++    if cam.animation_data:
++        cam.animation_data_clear()
++    for c in list(cam.constraints):
++        cam.constraints.remove(c)
++    c = cam.constraints.new(type='TRACK_TO')
++    c.target = target
++    c.track_axis = 'TRACK_NEGATIVE_Z'  # 相機的負Z軸（前方）指向目標
++    c.up_axis = 'UP_Y'                 # Y軸保持向上
+ 
+-    # bpy.ops.outliner.item_activate(deselect_all=True)
+-    # bpy.context.space_data.context = 'PARTICLES'
+-    bpy.context.object.show_instancer_for_render = False
+-    bpy.context.object.show_instancer_for_viewport = False
+-    #I have no idea which one actually works to increase resolution so I change all
+-    # bpy.data.particles["ParticleSettings"].display_step = 7
+-    # bpy.data.particles["ParticleSettings"].hair_step = 7
+-    # bpy.data.particles["ParticleSettings"].render_step = 7
+-    bpy.data.particles["ParticleSettings"].display_step = resolution
+-    bpy.data.particles["ParticleSettings"].hair_step = resolution
+-    bpy.data.particles["ParticleSettings"].render_step = resolution
+-    
+-
+-    #hide everything except scalp
+-    for obj in bpy.data.objects:
+-        print("obj", obj)
+-        if obj.name!="smplx_scalp_blender":
+-            obj.hide_render=True
+-            obj.hide_viewport=True
++    
++    bpy.context.view_layer.update()
++
++
++
++
++MAX_WIND_STRENGTH = 10.0
++MAX_WIND_ANGLE_DELTA = 5
++MAX_WIND_STRENGTH_DELTA = MAX_WIND_STRENGTH * 0.1
++NUM_OF_WIND = 4
++
++def clamp_value(value, min_val, max_val):
++    """Clamp value to be within min and max bounds"""
++    return max(min_val, min(max_val, value))
++
++def wrap_angle(angle):
++    """Wrap angle to be within 0-360 degrees"""
++    return angle % 360
++
++
++
++def generate_sudden_wind_traces(num_frames=81, num_traces=1, add_wind=False):
++    """
++    Generate a single wind trace with two sudden gust intervals.
++    - Strength is 30 during 20%-30% and 70%-80% of frames, else 0.
++    - Yaw and pitch are constant for the whole sequence.
++
++    Args:
++        num_frames: Number of frames to generate (default 81)
++        num_traces: Ignored; always generate exactly one trace
++        add_wind: Ignored
++
++    Returns:
++        List with one trace containing per-frame wind conditions
++    """
++    traces = []
++
++    # Random but constant direction across all frames
++    trace_yaw = 90
++    trace_pitch = 0
++
++    trace_frames = []
++
++    for frame_idx in range(num_frames):
++        frame_number = frame_idx + 1  # Blender frames start at 1
++        ratio = frame_number / float(num_frames)
++
++        if (ratio>= 0.2 and ratio <= 0.4) or (ratio >= 0.7 and ratio <= 0.9):
++            frame_strength = 10.0
++        else:
++            frame_strength = -5.0
++
++        trace_frames.append({
++            'frame': frame_number,
++            'yaw': trace_yaw,
++            'pitch': trace_pitch,
++            'strength': frame_strength
++        })
++
++    traces.append({
++        'trace_id': 0,
++        'frames': trace_frames
++    })
++    
++   
++
++    return traces
++
++def generate_wind_traces(num_frames=81, num_traces=NUM_OF_WIND, add_wind=False):
++    """
++    Generate per-frame wind conditions for multiple traces
++    Each trace gets its own randomized initial conditions
++    
++    Args:
++        num_frames: Number of frames to generate (default 81)
++        num_traces: Number of wind traces to generate (default 4)
++    
++    Returns:
++        List of traces, each containing per-frame wind conditions
++    """
++    traces = []
++    
++    for trace_idx in range(num_traces):
++        # Randomize initial conditions for each trace
++        # Random yaw direction (0-360 degrees)
++        trace_yaw = np.random.uniform(0, 360)
++        
++        # Random pitch direction (-60 to +60 degrees) 
++        trace_pitch = np.random.uniform(-60, 60)
++        
++        # Random initial strength using MAX_WIND_STRENGTH
++        if add_wind:
++            trace_strength = np.random.uniform(0, MAX_WIND_STRENGTH)
+         else:
+-            print("smplx scalp blender doesn't get hidden")
+-    # for obj in bpy.scene.objects:
+-        # print("obj in scene", obj)
++            trace_strength = 0.0
++        
++        trace_frames = []
++        
++        for frame_idx in range(num_frames):
++            if frame_idx == 0:
++                # First frame uses the randomized initial values
++                frame_yaw = trace_yaw
++                frame_pitch = trace_pitch
++                frame_strength = trace_strength
++            else:
++                # Subsequent frames: add small random changes
++                prev_frame = trace_frames[frame_idx - 1]
++                
++                # Random changes within allowed deltas
++                yaw_delta = np.random.uniform(-MAX_WIND_ANGLE_DELTA, MAX_WIND_ANGLE_DELTA)
++                pitch_delta = np.random.uniform(-MAX_WIND_ANGLE_DELTA, MAX_WIND_ANGLE_DELTA)
++                if add_wind:
++                    strength_delta = np.random.uniform(-MAX_WIND_STRENGTH_DELTA, MAX_WIND_STRENGTH_DELTA)
++                else:
++                    strength_delta = 0.0
++                
++                # Apply changes with clamping/wrapping
++                frame_yaw = wrap_angle(prev_frame['yaw'] + yaw_delta)
++                frame_pitch = clamp_value(prev_frame['pitch'] + pitch_delta, -60, 60)
++                if add_wind:
++                    frame_strength = clamp_value(prev_frame['strength'] + strength_delta, 0, MAX_WIND_STRENGTH)
++                else:
++                    frame_strength = 0.0
++            
++            trace_frames.append({
++                'frame': frame_idx + 1,  # Blender frames start at 1
++                'yaw': frame_yaw,
++                'pitch': frame_pitch,
++                'strength': frame_strength
++            })
++        
++        traces.append({
++            'trace_id': trace_idx,
++            'frames': trace_frames
++        })
++    
++    return traces
+ 
++def save_physics_data_to_json(traces, camera_data, output_path, head_motion=None):
++    """
++    Save wind traces, camera data, and optional head motion keyframes to physics.json file in the output directory
++    
++    Args:
++        traces: List of wind traces generated by generate_wind_traces()
++        camera_data: Dictionary containing camera configuration
++        output_path: Output directory path
++        head_motion: Optional dictionary containing head motion keyframes data
++    """
++    physics_json_path = os.path.join(output_path, "physics.json")
++    
++    # Create output directory if it doesn't exist
++    os.makedirs(output_path, exist_ok=True)
++    
++    physics_data = {
++        "camera": camera_data,
++        "wind": {
++            "num_traces": len(traces),
++            "num_frames": len(traces[0]['frames']) if traces else 0,
++            "traces": traces
++        }
++    }
++    
++    if head_motion is not None:
++        physics_data["head_motion"] = head_motion
++    
++    with open(physics_json_path, 'w') as f:
++        json.dump(physics_data, f, indent=2)
++    
++    print(f"Physics data (camera + wind traces) saved to: {physics_json_path}")
++    return physics_json_path
++
++def generate_head_motion_keyframes(num_frames=81, step=20, obj_name='SMPLX-lh-neutral', bone_name='head'):
++    """
++    Generate and apply head motion keyframes on the given armature's head bone.
++
++    From frame 1, every `step` frames, add one keyframe by sampling two quaternion components
++    of the head bone rotation:
++      - rotation_quaternion[1] (x): sample region from [(0.2, 0.3), (-0.05, 0.05), (-0.3, -0.2)]
++      - rotation_quaternion[2] (y): sample region from [(0.4, 0.6), (-0.1, 0.1), (-0.6, -0.4)]
++
++    Returns a dict with metadata and per-keyframe quaternion values for saving to physics.json.
++    """
++    arm_obj = bpy.data.objects.get(obj_name)
++    if arm_obj is None:
++        print(f"Warning: Armature object {obj_name} not found; skipping head motion")
++        return None
++    
++    try:
++        pbone = arm_obj.pose.bones[bone_name]
++    except KeyError:
++        print(f"Warning: Pose bone {bone_name} not found on {obj_name}; skipping head motion")
++        return None
++    
++    # Ensure quaternion mode
++    pbone.rotation_mode = 'QUATERNION'
++    
++    # Define sampling regions
++    regions_x = [(0.2, 0.3), (-0.05, 0.05), (-0.3, -0.2)]
++    regions_y = [(0.4, 0.6), (-0.1, 0.1), (-0.6, -0.4)]
++    
++    frames_list = []
++    
++    # Compute frame indices: 1, 1+step, ..., do not include last frame if not aligned
++    key_frames = list(range(step + 1, num_frames + 1, step))
++    
++    # set current frame to the first keyframe
++    pbone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
++    pbone.keyframe_insert(data_path='rotation_quaternion', frame=1)
++    
++    # Keep track of previous region indices to sample nearby regions
++    prev_ridx_x = 1
++    prev_ridx_y = 1
+ 
++    for f in key_frames:
++        # Sample regions, preferring nearby (same or adjacent) to the previous region
++        if prev_ridx_x is None:
++            ridx_x = np.random.randint(0, len(regions_x))
++        else:
++            candidate_x_indices = [prev_ridx_x]
++            if prev_ridx_x - 1 >= 0:
++                candidate_x_indices.append(prev_ridx_x - 1)
++            if prev_ridx_x + 1 < len(regions_x):
++                candidate_x_indices.append(prev_ridx_x + 1)
++            ridx_x = int(np.random.choice(candidate_x_indices))
+ 
+-    bpy.data.objects['smplx_scalp_blender'].hide_render=False
+-    bpy.data.objects['smplx_scalp_blender'].hide_viewport=False
+-    bpy.data.objects['smplx_scalp_blender'].show_instancer_for_render = False
+-    bpy.data.objects['smplx_scalp_blender'].show_instancer_for_viewport = False
+-    bpy.data.objects["smplx_scalp_blender"].select_set(True)
++        if prev_ridx_y is None:
++            ridx_y = np.random.randint(0, len(regions_y))
++        else:
++            candidate_y_indices = [prev_ridx_y]
++            if prev_ridx_y - 1 >= 0:
++                candidate_y_indices.append(prev_ridx_y - 1)
++            if prev_ridx_y + 1 < len(regions_y):
++                candidate_y_indices.append(prev_ridx_y + 1)
++            ridx_y = int(np.random.choice(candidate_y_indices))
++        low_x, high_x = regions_x[ridx_x]
++        low_y, high_y = regions_y[ridx_y]
++        # Sample values uniformly within chosen regions
++        x_val = float(np.random.uniform(min(low_x, high_x), max(low_x, high_x)))
++        y_val = float(np.random.uniform(min(low_y, high_y), max(low_y, high_y)))
++        z_val = 0.0
++        # Normalize quaternion assuming small rotations: compute w to keep unit length
++        w_sq = max(0.0, 1.0 - (x_val * x_val + y_val * y_val + z_val * z_val))
++        w_val = float(math.sqrt(w_sq))
++        
++        # Apply to pose bone and insert keyframe
++        pbone.rotation_quaternion = (w_val, x_val, y_val, z_val)
++        pbone.keyframe_insert(data_path='rotation_quaternion', frame=f)
++        
++        frames_list.append({
++            'frame': int(f),
++            'rotation_quaternion': [w_val, x_val, y_val, z_val]
++        })
++
++        # Update previous indices
++        prev_ridx_x = ridx_x
++        prev_ridx_y = ridx_y
++    
++    bpy.context.view_layer.update()
++    print(f"Added {len(frames_list)} head motion keyframes to {obj_name}.{bone_name}")
++    
++    # set key frame of last frame to the last keyframe
++    pbone.keyframe_insert(data_path='rotation_quaternion', frame=num_frames)
++    
++    return {
++        'object': obj_name,
++        'bone': bone_name,
++        'step': step,
++        'num_frames': num_frames,
++        'frames': frames_list
++    }
++
++def setup_wind_position(center_xyz, yaw_deg, pitch_deg=0, wind_name='Wind', fixed_radius=None):
++    """Move wind to specific yaw and pitch angles relative to scalp center and orient it toward the scalp"""
++    # Get wind object
++    wind_obj = bpy.data.objects.get(wind_name)
++    if wind_obj is None:
++        print(f"Warning: {wind_name} object not found")
++        return
++    
++    # Get center and determine radius
++    cx, cy, cz = center_xyz
++    
++    if fixed_radius is not None:
++        # Use provided fixed radius
++        wind_r = fixed_radius
++    else:
++        # Calculate current wind radius (including z-axis)
++        wind_r = math.sqrt((wind_obj.location.x - cx)**2 + (wind_obj.location.y - cy)**2 + (wind_obj.location.z - cz)**2)
++        # Use default radius if current radius is too small
++        if wind_r < 1e-4:
++            wind_r = 10.0  # Default radius
++    
++    # Convert angles to radians
++    initial_theta = -math.pi / 2  # -Y方向对应角度为-π/2
++    target_theta = initial_theta + math.radians(yaw_deg)
++    pitch_rad = math.radians(pitch_deg)
++    
++    # Calculate position with both yaw and pitch
++    # Yaw rotation around Z-axis, pitch rotation affects height
++    wind_x = cx + wind_r * math.cos(target_theta) * math.cos(pitch_rad)
++    wind_y = cy + wind_r * math.sin(target_theta) * math.cos(pitch_rad)
++    wind_z = cz + wind_r * math.sin(pitch_rad)   
++    
++    wind_obj.location = Vector((wind_x, wind_y, wind_z))
++    
++    # Calculate direction vector from wind to center (scalp)
++    direction = Vector((cx - wind_x, cy - wind_y, cz - wind_z))
++    
++    # Normalize the direction vector
++    if direction.length > 0:
++        direction.normalize()
++    else:
++        print("Warning: Wind is at the same position as center, cannot orient toward scalp")
++        return
++    
++    # Based on observation: wind blows in +Z direction in this setup
++    # Orient the wind object so its +Z axis points toward the scalp
++    track_quat = direction.to_track_quat('Z', 'Y')
++    wind_obj.rotation_euler = track_quat.to_euler()
++    
++    print(f"Wind oriented using Z track axis (confirmed wind direction)")
++    
++    print(f"Wind moved to yaw {yaw_deg}° pitch {pitch_deg}° at position ({wind_x:.2f}, {wind_y:.2f}, {wind_z:.2f}) and oriented toward scalp")
++    
++    bpy.context.view_layer.update()
++
++def create_wind_objects(num_winds=NUM_OF_WIND):
++    """
++    Create multiple wind objects in Blender scene
++    
++    Args:
++        num_winds: Number of wind objects to create (default 4)
++    
++    Returns:
++        List of wind object names
++    """
++    wind_names = []
++    
++    # Get the original Wind object as a template
++    original_wind = bpy.data.objects.get('Wind')
++    if original_wind is None:
++        print("Warning: Original Wind object not found")
++        return wind_names
++    
++    print(f"Original Wind object found: {original_wind.name}")
++    print(f"Original Wind data: {original_wind.data}")
++    print(f"Original Wind has field: {hasattr(original_wind, 'field')}")
++    print(f"Original Wind location: {original_wind.location}")
++    print(f"Original Wind rotation: {original_wind.rotation_euler}")
++    print(f"Original Wind scale: {original_wind.scale}")
++    
++    # Use the first wind object as is
++    wind_names.append('Wind')
++    
++    # Create additional wind objects by duplicating the original
++    for i in range(1, num_winds):
++        wind_name = f'Wind_{i}'
++        
++        # Check if wind object already exists
++        if bpy.data.objects.get(wind_name) is not None:
++            print(f"Wind object {wind_name} already exists, using existing one")
++            wind_names.append(wind_name)
++            continue
++            
++        # Duplicate the original wind object
++        new_wind = original_wind.copy()
++        # Wind objects might not have data (they're empty objects with force fields)
++        if original_wind.data is not None:
++            new_wind.data = original_wind.data.copy()
++        new_wind.name = wind_name
++        
++        # Link to the scene
++        bpy.context.collection.objects.link(new_wind)
++        
++        # Ensure the new wind object has the same location and rotation as original
++        new_wind.location = original_wind.location.copy()
++        new_wind.rotation_euler = original_wind.rotation_euler.copy()
++        new_wind.scale = original_wind.scale.copy()
++        
++        print(f"Copied location: {new_wind.location}")
++        print(f"Copied rotation: {new_wind.rotation_euler}")
++        
++        # Ensure the new wind object has the same force field properties
++        try:
++            if hasattr(original_wind, 'field') and original_wind.field:
++                # Copy force field settings
++                new_wind.field.type = original_wind.field.type
++                new_wind.field.strength = original_wind.field.strength
++                new_wind.field.noise = original_wind.field.noise
++                new_wind.field.flow = original_wind.field.flow
++                new_wind.field.shape = original_wind.field.shape
++                new_wind.field.falloff_type = original_wind.field.falloff_type
++                new_wind.field.size = original_wind.field.size
++                print(f"Force field properties copied to {wind_name}")
++            else:
++                print(f"Warning: Original wind object has no force field properties")
++        except Exception as e:
++            print(f"Warning: Failed to copy force field properties to {wind_name}: {e}")
++        
++        # Update the view layer to ensure changes are applied
++        bpy.context.view_layer.update()
++        
++        
++        wind_names.append(wind_name)
++        
++        print(f"Created wind object: {wind_name} with matching transform")
++    
++    return wind_names
+ 
++def apply_wind_keyframes(center_xyz, wind_trace, wind_name='Wind'):
++    """
++    Apply per-frame wind conditions as keyframes in Blender
++    
++    Args:
++        center_xyz: Scalp centroid position
++        wind_trace: Single wind trace containing per-frame conditions
++        wind_name: Name of the wind object in Blender
++    """
++    # Get wind object
++    wind_obj = bpy.data.objects.get(wind_name)
++    if wind_obj is None:
++        print(f"Warning: {wind_name} object not found")
++        return
++    
++    # Clear existing animation data
++    if wind_obj.animation_data:
++        wind_obj.animation_data_clear()
++    
++    # Calculate initial fixed radius to maintain throughout animation
++    cx, cy, cz = center_xyz
++    fixed_radius = math.sqrt((wind_obj.location.x - cx)**2 + (wind_obj.location.y - cy)**2 + (wind_obj.location.z - cz)**2)
++    if fixed_radius < 1e-4:
++        fixed_radius = 10.0  # Default radius
++    
++    print(f"Using fixed radius {fixed_radius:.2f} for wind object {wind_name}")
++    
++    # Apply keyframes for each frame
++    for frame_data in wind_trace['frames']:
++        frame_num = frame_data['frame']
++        yaw = frame_data['yaw']
++        pitch = frame_data['pitch']
++        strength = frame_data['strength']
++        
++        # Set the frame
++        bpy.context.scene.frame_set(frame_num)
++        
++        # Update wind position based on yaw and pitch with fixed radius
++        setup_wind_position(center_xyz, yaw, pitch, wind_name, fixed_radius)
++        
++        # Set wind strength
++        wind_obj.field.strength = strength
++        
++        # Insert keyframes for position and strength
++        wind_obj.keyframe_insert(data_path="location", frame=frame_num)
++        wind_obj.keyframe_insert(data_path="rotation_euler", frame=frame_num)
++        wind_obj.keyframe_insert(data_path="field.strength", frame=frame_num)
++    
++    print(f"Applied {len(wind_trace['frames'])} keyframes to wind object {wind_name}")
++    bpy.context.view_layer.update()
+ 
++def apply_all_wind_traces(center_xyz, wind_traces, wind_names):
++    """
++    Apply all wind traces to their corresponding wind objects
++    
++    Args:
++        center_xyz: Scalp centroid position
++        wind_traces: List of wind traces
++        wind_names: List of wind object names
++    """
++    if len(wind_traces) != len(wind_names):
++        print(f"Warning: Number of wind traces ({len(wind_traces)}) doesn't match number of wind objects ({len(wind_names)})")
++        
++    # Apply each trace to its corresponding wind object
++    for i, (trace, wind_name) in enumerate(zip(wind_traces, wind_names)):
++        print(f"Applying wind trace {i} to {wind_name}")
++        apply_wind_keyframes(center_xyz, trace, wind_name)
+ 
+-    bpy.ops.wm.alembic_export(filepath=out_alembic_path, check_existing=False, start=1, end=1,selected=True, visible_objects_only=True, uvs=False, packuv=False, normals=False, use_instancing=False, global_scale=1.0, export_hair=True, export_particles=False, as_background_job=False, evaluation_mode='VIEWPORT', init_scene_frame_range=True)
+ 
++path_cur_script=os.path.dirname(os.path.abspath(__file__))
+ 
+ 
+ def main():
+@@ -117,13 +641,31 @@ def main():
+     parser.add_argument('-vs', '--vertex_subsample', type=float, default=1.0)  # perentage of vertices per strand to keep (1.0=keep all, 0.5=keep half, 0.25=keep quarter)
+     parser.add_argument('-ar', '--alembic_resolution', type=int, default=7) #the resolution of the alembic, higher number means more points per strand (default=7 which is probably 2^7=128 points per strands)
+     parser.add_argument('-sh', '--shrinkwrap', action='store_true') #set it to true to perform a shrinkwrap of the hair so that it avoids penetrating through the body
++    parser.add_argument('-bt', '--blender_template', type=str, default='./assets/lwk_template_wind.blend') #set it to true to perform a shrinkwrap of the hair so that it avoids penetrating through the body
++    parser.add_argument('--stiffness', type=float, default=3.0) #the stiffness of the hair
++    parser.add_argument('--damping', type=float, default=2.0) #the damping of the hair
++    parser.add_argument('--mass', type=float, default=0.3) #the mass of the hair
++    parser.add_argument('--orbit_camera', action='store_true') #set it to true to perform a shrinkwrap of the hair so that it avoids penetrating through the body
++    parser.add_argument('--fixed_cam_deg', type=float, default=-30) #fix camera at specific degree (conflicts with orbit)
++    parser.add_argument('--cam_radius_factor', type=float, default=1.0) #multiply camera radius by this factor
++    parser.add_argument('--gravity', type=float, default=1.0) #gravity of the hair
++    parser.add_argument('--wind_deg', type=float, default=0.0) #initial wind direction in degrees
++    parser.add_argument('--wind_strength', type=float, default=5.0) #initial wind strength
++    parser.add_argument('--add_head_motion', action='store_true', help='add head motion to the joints')
++    parser.add_argument('--add_wind', action='store_true', help='add wind forces and keyframes')
++    parser.add_argument('--sudden_wind', action='store_true', help='add sudden wind')
+     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
+     print("strands_subsample", args.strands_subsample)
+     print("vertex_subsample", args.vertex_subsample)
+     print("alembic_resolution", args.alembic_resolution)
+     print("shrinkwrap", args.shrinkwrap)
+-
+-
++    print("orbit_camera", args.orbit_camera)
++    print("fixed_cam_deg", args.fixed_cam_deg)
++    print("cam_radius_factor", args.cam_radius_factor)
++    print("gravity", args.gravity)
++    print("wind_deg", args.wind_deg)
++    print("wind_strength", args.wind_strength)
++    print("sudden_wind", args.sudden_wind)
+     #read npz 
+     path_hair=args.input_npz
+     do_export_alembic=args.export_alembic
+@@ -131,7 +673,8 @@ def main():
+ 
+     hair_geom=np.load(path_hair)
+     points=hair_geom["positions"] #nr_strands x nr_points_per_strand x 3
+-
++    
++    
+ 
+     subsample_nr_strands=False
+     #removes randomly x amount of strands or X nr of vertices
+@@ -147,7 +690,12 @@ def main():
+         #removing verts now 
+         nr_verts_to_skip=int(np.floor(1.0/args.vertex_subsample))
+         print("nr_verts_to_skip",nr_verts_to_skip)
+-        points = points[:, ::nr_verts_to_skip, :].copy()
++        indices = np.unique(np.concatenate([
++            np.arange(0, points.shape[1], nr_verts_to_skip),
++            [points.shape[1] - 1]  # Always include final vertex
++        ]))
++
++        points = points[:, indices, :].copy()
+         print("after removing consecurive vertices, points is ", points.shape)
+     print("final points", points.shape)
+ 
+@@ -159,10 +707,91 @@ def main():
+     # else:
+     #     path_in_blend=os.path.join(path_cur_script,"./assets/blender_vis_base_v24.blend")
+     # path_in_blend=os.path.join(path_cur_script,"./assets/blender_vis_base_v27_blender36.blend")
+-    path_in_blend=os.path.join(path_cur_script,"./assets/blender_vis_base_v26_with_shrinkwrap_full_base.blend")
++    # path_in_blend=os.path.join(path_cur_script,"./assets/blender_vis_base_v26_with_shrinkwrap_full_base.blend")
++    path_in_blend=os.path.join(path_cur_script, args.blender_template)
+     bpy.ops.wm.open_mainfile(filepath=path_in_blend)
+ 
+ 
++    # get scalp mass center
++    obj = bpy.data.objects['smplx_scalp_blender']
++    mesh = obj.data
++    verts_world = [obj.matrix_world @ v.co for v in mesh.vertices]
++    scalp_centroid = mathutils.Vector((0, 0, 0))
++    for v in verts_world:
++        scalp_centroid += v
++    scalp_centroid /= len(verts_world)
++    
++    
++    
++
++
++    # Camera setup - orbit takes precedence over fixed
++    camera_data = {
++        "type": "orbit" if args.orbit_camera else "fixed",
++        "radius_factor": args.cam_radius_factor,
++        "num_frames": 81
++    }
++    
++    if args.orbit_camera:
++        print(f"Setting up orbit camera with radius factor {args.cam_radius_factor}")
++        setup_orbit_camera(scalp_centroid, 81, cam_name='Camera.001', clockwise=False, radius_factor=args.cam_radius_factor)
++        camera_data["clockwise"] = False
++    else:
++        print(f"Setting up fixed camera at {args.fixed_cam_deg}° with radius factor {args.cam_radius_factor}")
++        setup_fixed_camera(scalp_centroid, args.fixed_cam_deg, cam_name='Camera.001', radius_factor=args.cam_radius_factor)
++        camera_data["fixed_deg"] = args.fixed_cam_deg
++    
++
++    # Wind positioning setup - Generate per-frame wind conditions
++    print(f"Setting up per-frame wind system")
++    
++    # Generate wind traces with randomized initial conditions for each trace
++    if args.sudden_wind:
++        print(f"Generating 1 sudden wind trace with 81 frames")
++        wind_traces = generate_sudden_wind_traces(
++            num_frames=81,
++            num_traces=1,
++            add_wind=args.add_wind
++        )
++        print("wind_traces", wind_traces)
++    else:
++        print(f"Generating {NUM_OF_WIND} wind traces with 81 frames each")
++        wind_traces = generate_wind_traces(
++            num_frames=81,
++            num_traces=NUM_OF_WIND,
++            add_wind=args.add_wind
++        )
++    
++    # Optionally generate head motion keyframes and include in physics.json
++    head_motion_data = None
++    if args.add_head_motion:
++        print("Generating head motion keyframes (every 20 frames from frame 1)")
++        head_motion_data = generate_head_motion_keyframes(
++            num_frames=81,
++            step=20,
++            obj_name='SMPLX-lh-neutral',
++            bone_name='head'
++        )
++
++    # Save physics data (camera + wind traces + optional head motion) to JSON file
++    save_physics_data_to_json(wind_traces, camera_data, args.out_path, head_motion=head_motion_data)
++    
++    # Create multiple wind objects for all traces
++    if args.sudden_wind:
++        wind_names = create_wind_objects(1)
++    else:
++        wind_names = create_wind_objects(NUM_OF_WIND)
++    
++    # Apply all wind traces to their corresponding wind objects
++    if wind_traces and wind_names:
++        apply_all_wind_traces(scalp_centroid, wind_traces, wind_names)
++    
++    # Set wind noise to 0 for all wind objects
++    for wind_name in wind_names:
++        if bpy.data.objects.get(wind_name):
++            bpy.data.objects[wind_name].field.noise = 0.0
++
++
+     #write new geometry
+     print("creating geometry")
+     bpy.data.objects["hair_01"].select_set(True)
+@@ -180,6 +809,9 @@ def main():
+     # nr_strands=3000
+     nr_points_per_strand=points.shape[1]
+ 
++
++
++    
+     #v4 faster
+     points_per_curve = [nr_points_per_strand for i in range(nr_strands)]
+     curves_data.add_curves(points_per_curve)
+@@ -211,19 +843,241 @@ def main():
+     # bpy.ops.object.mode_set(mode='OBJECT') 
+     bpy.context.view_layer.update()
+ 
++    # Convert to particle system before saving
++    print("converting hair_01 to particle system")
++    bpy.data.objects["hair_01"].select_set(True)
++    hair = bpy.data.objects["hair_01"]
++    bpy.context.view_layer.objects.active = hair
++
++    # Apply all geometry node modifiers first
++    start = time.time()
++    for modif in hair.modifiers:
++        print("applying", modif.name)
++        bpy.context.view_layer.objects.active = hair
++        bpy.ops.object.modifier_apply(modifier=modif.name)
++    print("finished applying all geometry nodes")
++    end = time.time()
++    print("applying geometry nodes took", end-start)
++
++    # Convert to particle system
++    # First, set the surface object for the curves
++    print("setting surface object for curves")
++    hair.data.surface = bpy.data.objects["smplx_scalp_blender"]
++    hair.data.surface_uv_map = ""  # Use default UV map
++    
++    bpy.ops.curves.convert_to_particle_system()
++    
++    bpy.data.particles["ParticleSettings"].display_step = args.alembic_resolution
++    bpy.data.particles["ParticleSettings"].hair_step = args.alembic_resolution
++    bpy.data.particles["ParticleSettings"].render_step = args.alembic_resolution
++    # Configure particle system settings
++    bpy.context.object.show_instancer_for_render = False
++    bpy.context.object.show_instancer_for_viewport = False
++    
++    
++    bpy.data.particles["ParticleSettings"].child_type = 'SIMPLE'
++    bpy.data.particles["ParticleSettings"].rendered_child_count = 30
++    
++    bpy.data.particles["ParticleSettings"].root_radius = 0.1
++    bpy.data.scenes["Scene"].cycles.samples = 8
++    
++
++    
++    # Apply Bgen_Hair_Shader material to particle system
++    print("applying Bgen_Hair_Shader material to particle system")
++    if "Bgen_Hair_Shader" in bpy.data.materials:
++        # Find the material index for Bgen_Hair_Shader
++        scalp_obj = bpy.data.objects["smplx_scalp_blender"]
++        hair_material_index = -1
++        for i, slot in enumerate(scalp_obj.material_slots):
++            if slot.material and slot.material.name == "Bgen_Hair_Shader":
++                hair_material_index = i
++                break
++        
++        if hair_material_index >= 0:
++            # Set the material index for the particle system (under Render section in GUI)
++            # Access through the object's particle system settings
++            if len(scalp_obj.particle_systems) > 0:
++                particle_system = scalp_obj.particle_systems[0]
++                particle_system.settings.material = hair_material_index + 1  # Blender uses 1-based indexing
++                print(f"applied Bgen_Hair_Shader material (index {hair_material_index + 1}) to particle system")
++            else:
++                print("No particle system found on scalp object")
++        else:
++            print("Bgen_Hair_Shader material not found in material slots")
++    else:
++        print("Bgen_Hair_Shader material not found in scene")
++
++    # Enable hair dynamics if requested
+ 
++    print("enabling hair dynamics")
++    scalp_obj = bpy.data.objects["smplx_scalp_blender"]
++    if len(scalp_obj.particle_systems) > 0:
++        particle_system = scalp_obj.particle_systems[0]
++        
++        # Enable hair dynamics on the particle system
++        particle_system.use_hair_dynamics = True
++        cloth = particle_system.cloth
++        cloth.settings.mass = args.mass
++        cloth.settings.bending_stiffness = args.stiffness
++        cloth.settings.bending_damping = args.damping
+ 
++        
++        bpy.data.particles["ParticleSettings"].effector_weights.gravity = args.gravity
++
++    else:
++        print("No particle system found - cannot enable hair dynamics")
++
++    
++    # bpy.data.materials["SMPLX-neutral.003"].name='SMPLX-neutral.003'
++    # Delete the original hair_01 curve object after conversion
++    print("deleting original hair_01 object")
++    if "hair_01" in bpy.data.objects:
++        bpy.data.objects.remove(bpy.data.objects["hair_01"], do_unlink=True)
++        print("original hair_01 object deleted")
+     #save blend file
+-    print('saving .blend')
+-    out_scene_path=os.path.join(args.out_path, "blender_scene.blend")
+-    bpy.ops.wm.save_as_mainfile(filepath=out_scene_path) 
+-    print('finished saving .blend')
++    
++    
++    # print('saving .blend')
++    # out_scene_path=os.path.join(args.out_path, "saved_w_hair_and_physics.blend")
++    # bpy.ops.wm.save_as_mainfile(filepath=out_scene_path) 
++    # print('finished saving .blend')
++    # exit(1)
++        
++        
++    # add rendering here
++    print("setting up depth map rendering for hair segmentation")
++    
++    # Set render properties
++    scene = bpy.context.scene
++    scene.render.engine = 'CYCLES'  # or 'BLENDER_EEVEE' for faster rendering
++    scene.render.resolution_x = 480
++    scene.render.resolution_y = 832
++    scene.render.resolution_percentage = 100
++    
++    bpy.data.scenes["Scene"].simulation_frame_end = 81
++    
++    # Set animation frame range
++    scene.frame_start = 1
++    scene.frame_end = 81  
++    scene.frame_set(1)
++    
++    bpy.data.scenes["Scene"].render.fps = 15
+ 
++    # Enable depth pass FIRST
++    bpy.context.view_layer.use_pass_z = True
++    
++    
++    # Enable compositor and set up depth output
++    scene.use_nodes = True
++    tree = scene.node_tree
++    
++    # Clear existing nodes
++    for node in tree.nodes:
++        tree.nodes.remove(node)
++    
++    # Create render layers and composite nodes
++    render_layers = tree.nodes.new(type='CompositorNodeRLayers')
++    composite = tree.nodes.new(type='CompositorNodeComposite')
++    
++    # Create file output node for depth
++    file_output = tree.nodes.new(type='CompositorNodeOutputFile')
++    file_output.format.file_format = 'OPEN_EXR'
++    file_output.format.color_depth = '32'
++    file_output.format.color_mode = 'RGB'  # RGB format for depth
++    
++
++    
++    # Connect depth output (use 'Depth' or 'Z' depending on Blender version)
++    try:
++        tree.links.new(render_layers.outputs['Depth'], file_output.inputs[0])
++    except KeyError:
++        try:
++            tree.links.new(render_layers.outputs['Z'], file_output.inputs[0])
++        except KeyError:
++            print("Available render layer outputs:", [output.name for output in render_layers.outputs])
++            raise Exception("Could not find depth output in render layers")
++    
++    tree.links.new(render_layers.outputs['Image'], composite.inputs['Image'])
++    
++    # FIRST: Render depth maps WITH hair visible
++    print("rendering depth maps WITH hair visible")
++    
++    # Create output directory for depth with hair
++    depth_w_hair_dir = os.path.join(args.out_path, "blender_depth_w_hair")
++    os.makedirs(depth_w_hair_dir, exist_ok=True)
++    
++    # Set file output path for depth with hair
++    file_output.base_path = depth_w_hair_dir
++    file_output.file_slots[0].path = "depth_w_hair_"
++    
++    # Set scene render filepath as backup
++    scene.render.filepath = os.path.join(depth_w_hair_dir, "render_w_hair_")
++    
++    print(f"rendering depth maps with hair to: {depth_w_hair_dir}")
++    
++    # Render the animation with hair visible
++    bpy.ops.render.render(animation=True)
++    print("depth maps with hair rendering completed")
++    
++    # SECOND: Hide hair and render depth maps WITHOUT hair
++    print("hiding hair and rendering depth maps WITHOUT hair")
++    
++    # Hide the hair particle system
++    scalp_obj = bpy.data.objects["smplx_scalp_blender"]
++    if len(scalp_obj.particle_systems) > 0:
++        particle_system = scalp_obj.particle_systems[0]
++        particle_system.settings.render_type = 'NONE'  # Hide hair for rendering
++        print("hair particle system hidden for rendering")
++    else:
++        print("Warning: No particle system found to hide")
++    
++    # Create output directory for depth without hair
++    depth_wo_hair_dir = os.path.join(args.out_path, "blender_depth_wo_hair")
++    os.makedirs(depth_wo_hair_dir, exist_ok=True)
++    
++    # Set file output path for depth without hair
++    file_output.base_path = depth_wo_hair_dir
++    file_output.file_slots[0].path = "depth_wo_hair_"
++    
++    # Set scene render filepath as backup
++    scene.render.filepath = os.path.join(depth_wo_hair_dir, "render_wo_hair_")
++    
++    print(f"rendering depth maps without hair to: {depth_wo_hair_dir}")
++    
++    # Render the animation without hair
++    bpy.ops.render.render(animation=True)
++    print("depth maps without hair rendering completed")
++    
++    # OPTIONAL: Restore hair visibility and render regular color frames
++    print("restoring hair visibility and rendering color frames")
++    if len(scalp_obj.particle_systems) > 0:
++        particle_system = scalp_obj.particle_systems[0]
++        particle_system.settings.render_type = 'PATH'  # Restore hair rendering
++    
++    # # Disable compositor for regular color rendering
++    # scene.use_nodes = False
++    
++    # # Set regular image output format
++    # scene.render.image_settings.file_format = 'PNG'
++    # scene.render.image_settings.color_mode = 'RGBA'
++    # scene.render.image_settings.color_depth = '8'
++    
++    # # Create output directory for regular color frames
++    # frames_output_dir = os.path.join(args.out_path, "blender_animation")
++    # os.makedirs(frames_output_dir, exist_ok=True)
++    
++    # # Set output filepath for frame sequence
++    # frames_output_path = os.path.join(frames_output_dir, "frame_")
++    # scene.render.filepath = frames_output_path
++    
++    # print(f"rendering color frames to: {frames_output_dir}")
++    # print("frame files will be named: frame_0001.png, frame_0002.png, etc.")
++    
++    # # Render the animation as frame sequence
++    # bpy.ops.render.render(animation=True)
++    # print("color frame sequence rendering completed")
+ 
+-    if do_export_alembic:
+-        out_path_alembic=os.path.join(args.out_path, "hair.abc")
+-        print("exporting hair to", out_path_alembic)
+-        export_alembic(out_path_alembic, args.alembic_resolution)
+ 
+    
+ if __name__ == '__main__':
+diff --git a/inference_difflocks.py b/inference_difflocks.py
+index 544ff03c7b3fc83251429c14da4ffe4ba52e31a3..3face6260a8e9492569389e7382f1b9a337eea05 100644
+--- a/inference_difflocks.py
++++ b/inference_difflocks.py
+@@ -8,13 +8,6 @@ from inference.img2hair import DiffLocksInference
+ import subprocess
+ import os
+ import argparse
+-import torch
+-import numpy as np
+-import random
+-
+-torch.manual_seed(5)
+-np.random.seed(5)
+-random.seed(5)
+ 
+ def run():
+ 
+@@ -33,26 +26,66 @@ def run():
+     parser.add_argument('--do_shrinkwrap', action='store_true', help='applies a shrinkwrap modifier in blender that pushes the strands away from the scalp so they dont pass through the head')
+     parser.add_argument('--img_path', type=str, required=True, help='Path to the image to do inference on')
+     parser.add_argument('--out_path', type=str, required=True, help='Path to the image to do inference on')
++    parser.add_argument('--blender_template', type=str, default='./assets/lwk_template_wind.blend', help='Path to the blender template')
++    parser.add_argument('--hair_gen', action='store_true', help='generate hair')
++    parser.add_argument('--stiffness', type=float, default=3.0) #the stiffness of the hair
++    parser.add_argument('--damping', type=float, default=2.0) #the damping of the hair
++    parser.add_argument('--mass', type=float, default=0.1) #the mass of the hair
++    parser.add_argument('--orbit_camera', action='store_true')
++    parser.add_argument('--fixed_cam_deg', type=float, default=0.0)
++    parser.add_argument('--cam_radius_factor', type=float, default=1.0)
++    parser.add_argument('--gravity', type=float, default=1.0)
++    
++    parser.add_argument('--add_head_motion', action='store_true', help='add head motion to the joints')
++    parser.add_argument('--add_wind', action='store_true', help='add wind forces and keyframes')
++    parser.add_argument('--sudden_wind', action='store_true', help='add sudden wind')
+     args = parser.parse_args()
+ 
+     print("args is", args)
+     
+-    difflocks= DiffLocksInference(args.strand_checkpoint_path, args.difflocks_config_path, args.difflocks_checkpoint_path, args.rgb2mat_checkpoint_path)
+-
+-
+-    #run----
+-    # img_path="./samples/medium_11.png"
+-    strand_points_world, hair_material_dict=difflocks.file2hair(args.img_path, args.out_path) 
+-    print("hair_material_dict",hair_material_dict)
++    out_path= args.out_path
+ 
++    if args.hair_gen:
++        difflocks= DiffLocksInference(args.strand_checkpoint_path, args.difflocks_config_path, args.difflocks_checkpoint_path, args.rgb2mat_checkpoint_path)
++        #run----
++        # img_path="./samples/medium_11.png"
++        strand_points_world, hair_material_dict=difflocks.file2hair(args.img_path, args.out_path) 
++        print("hair_material_dict",hair_material_dict)
+ 
++    # import ipdb; ipdb.set_trace()
+     #create blender file and optionally an alembic file
+     if args.blender_path!="":
+-        cmd=[args.blender_path, "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(args.out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution) ]
++        cmd=[args.blender_path, "-t", str(args.blender_nr_threads), "--background", "--python", "./inference/npz2blender.py", "--", "--input_npz", os.path.join(out_path,"difflocks_output_strands.npz"), "--out_path", args.out_path, "--strands_subsample", str(args.blender_strands_subsample), "--vertex_subsample", str(args.blender_vertex_subsample), "--alembic_resolution", str(args.alembic_resolution), "--blender_template", args.blender_template]
+         if args.do_shrinkwrap:
+             cmd.append("--shrinkwrap")
+         if args.export_alembic:
+             cmd.append("--export_alembic")
++        if args.stiffness is not None:
++            cmd.append("--stiffness")
++            cmd.append(str(args.stiffness))
++        if args.damping is not None:
++            cmd.append("--damping")
++            cmd.append(str(args.damping))
++        if args.mass is not None:
++            cmd.append("--mass")
++            cmd.append(str(args.mass))
++        if args.orbit_camera:
++            cmd.append("--orbit_camera")
++        if args.fixed_cam_deg is not None:
++            cmd.append("--fixed_cam_deg")
++            cmd.append(str(args.fixed_cam_deg))
++        if args.cam_radius_factor is not None:
++            cmd.append("--cam_radius_factor")
++            cmd.append(str(args.cam_radius_factor))
++        if args.gravity is not None:
++            cmd.append("--gravity")
++            cmd.append(str(args.gravity))
++        if args.add_head_motion:
++            cmd.append("--add_head_motion")
++        if args.add_wind:
++            cmd.append("--add_wind")
++        if args.sudden_wind:
++            cmd.append("--sudden_wind")
+         subprocess.run(cmd, capture_output=False)
+ 
+     print("Finished writing to ", args.out_path)
+

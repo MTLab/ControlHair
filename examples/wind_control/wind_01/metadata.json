@@ -1,0 +1,63 @@
+{
+  "artifacts": {
+    "control": {
+      "bytes": 726982,
+      "path": "control.mp4",
+      "sha256": "efb4d9c38e262fae8befebbf725e8443fba07048fe6cebf7ba2199bc4d2497bb"
+    },
+    "expected_output": {
+      "bytes": 443615,
+      "path": "expected_output.mp4",
+      "sha256": "ade392cdcff21b7e8f6d317267cbf14fa1245a1759176e75fff4086bf5d6c92b"
+    },
+    "input": {
+      "bytes": 586066,
+      "path": "input.png",
+      "sha256": "400fb23e0c4c6eb781d0384290be7c28cca0c930628a70a0c50e9751b3a02bb8"
+    },
+    "preview_triptych": {
+      "bytes": 816894,
+      "path": "preview_triptych.mp4",
+      "sha256": "9f7177fd14213e3146365efae05539ccd8a9edbfa76416b9ab83a6da032f739d"
+    }
+  },
+  "derivation": {
+    "control": "Middle panel cropped and re-encoded as H.264 CRF 18.",
+    "expected_output": "Right panel cropped and re-encoded as H.264 CRF 18.",
+    "input": "First decoded frame of the left panel; not the original source image."
+  },
+  "layout": {
+    "panel_order": [
+      "input",
+      "control",
+      "expected_output"
+    ],
+    "panel_width": 480,
+    "source_height": 832,
+    "source_width": 1440,
+    "type": "equal_width_triptych"
+  },
+  "license": {
+    "dataset": "Flickr-Faces-HQ (FFHQ)",
+    "dataset_license": "CC-BY-NC-SA-4.0",
+    "dataset_license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+    "dataset_url": "https://github.com/NVlabs/ffhq-dataset",
+    "note": "The reference portrait is FFHQ-derived. Individual FFHQ images retain their original Flickr licenses and attribution requirements.",
+    "status": "ffhq-source-confirmed"
+  },
+  "schema_version": 1,
+  "source": {
+    "commit": "e7416af727367e6bd4e133f25fe6c6c4b29dcfc2",
+    "path": "static/videos/BS/bs_wind2_ours.mp4",
+    "repository": "https://github.com/linwk20/controlhair-web",
+    "url": "https://media.githubusercontent.com/media/linwk20/controlhair-web/e7416af727367e6bd4e133f25fe6c6c4b29dcfc2/static/videos/BS/bs_wind2_ours.mp4"
+  },
+  "source_media": {
+    "avg_frame_rate": "15",
+    "codec_name": "h264 (High) (avc1 / 0x31637661)",
+    "duration": 5.4,
+    "height": 832,
+    "nb_frames": 81,
+    "width": 1440
+  }
+}

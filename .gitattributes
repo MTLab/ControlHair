@@ -1,0 +1,2 @@
+third_party/patches/*.patch -whitespace
+physics_simulation/assets/*.blend filter=lfs diff=lfs merge=lfs -text

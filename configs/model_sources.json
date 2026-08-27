@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "default_profile": "paper",
+    "profiles": {
+      "paper": {
+        "python": "3.10",
+        "cuda": "12.4",
+        "pytorch": "2.5.0",
+        "torchvision": "0.20.0",
+        "torchaudio": "2.5.0",
+        "index_url": "https://download.pytorch.org/whl/cu124",
+        "purpose": "ECCV paper and H100 training reproduction"
+      },
+      "blackwell": {
+        "python": "3.12",
+        "cuda": "13.0",
+        "pytorch": "2.12.1",
+        "torchvision": "0.27.1",
+        "torchaudio": null,
+        "index_url": "https://download.pytorch.org/whl/cu130",
+        "purpose": "RTX 50-series / sm_120 compatibility",
+        "validated_hardware": "2x NVIDIA GeForce RTX 5090",
+        "validated_driver": "595.58.03"
+      }
+    }
+  },
+  "source_repositories": {
+    "hairstep": {
+      "repository": "https://github.com/GAP-LAB-CUHK-SZ/HairStep.git",
+      "revision": "40ef81a213ac32879bc127c1bc1683bbcacc1b09",
+      "destination": "third_party/HairStep",
+      "license": "CC-BY-NC-4.0",
+      "restricted": true
+    },
+    "difflocks": {
+      "repository": "https://github.com/Meshcapade/difflocks.git",
+      "revision": "fcc73747dc60320c30228b6711000a53fc0c9d84",
+      "destination": "third_party/difflocks",
+      "license": "DiffLocks non-commercial scientific research license",
+      "restricted": true,
+      "patch": "third_party/patches/difflocks-fcc737-controlhair.patch",
+      "patch_manifest": "third_party/patches/difflocks-fcc737-controlhair.sha256"
+    },
+    "unianimate_dit": {
+      "repository": "https://github.com/ali-vilab/UniAnimate-DiT.git",
+      "revision": "61d882c25385042f0cf5bcdaf6853238d9756d68",
+      "destination": "third_party/UniAnimate-DiT",
+      "license": "No top-level license identified during release audit",
+      "restricted": true,
+      "patch": "third_party/patches/unianimate-61d882c-controlhair.patch",
+      "patch_manifest": "third_party/patches/unianimate-61d882c-controlhair.sha256"
+    },
+    "dwpose": {
+      "repository": "https://github.com/IDEA-Research/DWPose.git",
+      "revision": "3dca5db79d9f9ffdd378753ddf6ec66535aace88",
+      "destination": null,
+      "license": "Apache-2.0",
+      "restricted": false
+    },
+    "diffsynth_studio": {
+      "repository": "https://github.com/modelscope/DiffSynth-Studio.git",
+      "revision": "fed7b18fac2ed4cb802796eec91970e7659bccde",
+      "destination": null,
+      "license": "Apache-2.0",
+      "restricted": false
+    }
+  },
+  "models": {
+    "wan": {
+      "kind": "huggingface_snapshot",
+      "repository": "Wan-AI/Wan2.1-I2V-14B-720P",
+      "revision": "8823af45fcc58a8aa999a54b04be9abc7d2aac98",
+      "destination": "models/wan/Wan2.1-I2V-14B-720P",
+      "license": "Apache-2.0",
+      "restricted": false
+    },
+    "unianimate": {
+      "kind": "huggingface_snapshot",
+      "repository": "ZheWang123/UniAnimate-DiT",
+      "revision": "77f855e096ca9b1d62387bfd0c3fb2a9691702cf",
+      "destination": "models/unianimate",
+      "license": "MIT",
+      "restricted": false
+    },
+    "hairstep_networks": {
+      "kind": "google_drive_manual",
+      "file_id": "1-akuukaYYtJDta24AAqVdgUOGte4EmQf",
+      "destination": "third_party/HairStep/checkpoints",
+      "license": "HairStep non-commercial research terms",
+      "restricted": true,
+      "required_file": "third_party/HairStep/checkpoints/img2hairstep/img2strand.pth"
+    },
+    "difflocks_checkpoints": {
+      "kind": "official_interactive_script",
+      "script": "third_party/difflocks/download_checkpoints.sh",
+      "destination": "third_party/difflocks/checkpoints",
+      "license": "DiffLocks non-commercial scientific research license",
+      "restricted": true
+    },
+    "controlhair": {
+      "kind": "huggingface_snapshot",
+      "repository": "WK1997/control-hair-step-10000",
+      "revision": "e37f6d39397fa24fbe694a075f22e29968a62b36",
+      "destination": "models/controlhair/control-hair-step-10000",
+      "license": "Private repository; no license metadata set",
+      "restricted": true,
+      "private": true,
+      "files": 3,
+      "bytes": 2455299859,
+      "download_patterns": [
+        "model-controlhair-inference.safetensors"
+      ],
+      "download_bytes": 2455297792,
+      "inference_tensors": 826,
+      "inference_tensor_bytes": 2455193360,
+      "status": "private"
+    }
+  },
+  "datasets": {
+    "controlhair_480p": {
+      "kind": "huggingface_dataset_snapshot",
+      "repository": "WK1997/control-hair-480p-dataset",
+      "revision": "1d97c73ff695c75545a93c6714006c726d4961e0",
+      "destination": "datasets/control-hair-480p",
+      "license": "Private repository; no license metadata set",
+      "restricted": true,
+      "private": true,
+      "files": 44469,
+      "samples": 11117,
+      "bytes": 26199224769,
+      "status": "private"
+    }
+  }
+}

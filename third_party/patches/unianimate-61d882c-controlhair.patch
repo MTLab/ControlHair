@@ -1,0 +1,814 @@
+diff --git a/diffsynth/models/model_manager.py b/diffsynth/models/model_manager.py
+index cca1953d67fcecb86aa963b10a9a296122a99407..1a1de2091c3d66611235fc3214790477bb14ad8e 100644
+--- a/diffsynth/models/model_manager.py
++++ b/diffsynth/models/model_manager.py
+@@ -442,6 +442,67 @@ class ModelManager:
+             is_loaded = False
+             if len(state_dict) == 0:
+                 state_dict = load_state_dict(file_path)
++
++            # DeepSpeed checkpoints contain the complete training module.  Their
++            # adapter tensors are stored below ``pipe.dit.*`` alongside the base
++            # DiT weights, and the conditioning encoders are top-level modules.
++            # Passing this raw state dict to the generic LoRA matcher can produce
++            # a false-positive match with zero updated tensors.  Accumulate only
++            # the releasable inference weights across all shards instead.
++            is_training_checkpoint = any(
++                key.startswith("pipe.")
++                or key.startswith("pipe_VAE.")
++                or key.startswith("dwpose_embedding.")
++                or key.startswith("randomref_embedding_pose.")
++                for key in state_dict
++            )
++            if is_training_checkpoint:
++                for key, value in state_dict.items():
++                    if key.startswith((
++                        "dwpose_embedding.",
++                        "randomref_embedding_pose.",
++                        "inpaint_embedding.",
++                        "learn_in_embedding.",
++                    )):
++                        self.state_dict_new_module[key] = value
++                    elif key.startswith("pipe.dit.") and "lora" in key:
++                        self.state_dict_new[key.removeprefix("pipe.dit.")] = value
++
++                if not is_final:
++                    return
++                if not self.state_dict_new:
++                    raise ValueError(
++                        f"No LoRA tensors found in sharded training checkpoint: {file_path}"
++                    )
++
++                for model_name, model, model_path in zip(self.model_name, self.model, self.model_path):
++                    for lora in get_lora_loaders():
++                        match_results = lora.match(model, self.state_dict_new)
++                        if match_results is not None:
++                            print(f"    Adding composed LoRA to {model_name} ({model_path}).")
++                            lora_prefix, model_resource = match_results
++                            lora.load(
++                                model,
++                                self.state_dict_new,
++                                lora_prefix,
++                                alpha=lora_alpha,
++                                model_resource=model_resource,
++                            )
++                            is_loaded = True
++                            break
++                    if is_loaded:
++                        break
++
++                if not is_loaded:
++                    raise ValueError(
++                        f"Cannot load composed LoRA from sharded training checkpoint: {file_path}"
++                    )
++                print(
++                    f"    Loaded {len(self.state_dict_new)} LoRA tensors and "
++                    f"{len(self.state_dict_new_module)} conditioning tensors."
++                )
++                return
++
+             wx_success = False
+             # extract weights of "dwpose_embedding" for added modules
+             for key in state_dict.keys():
+@@ -551,4 +612,3 @@ class ModelManager:
+     def to(self, device):
+         for model in self.model:
+             model.to(device)
+-
+diff --git a/examples/unianimate_wan/inference_unianimate_wan_480p.py b/examples/unianimate_wan/inference_unianimate_wan_480p.py
+index 004eb693d607ecd5549a0194aca0223b823e4bd8..94feb3f20982d18636c06cfb344c9e8468576b59 100644
+--- a/examples/unianimate_wan/inference_unianimate_wan_480p.py
++++ b/examples/unianimate_wan/inference_unianimate_wan_480p.py
+@@ -1,4 +1,9 @@
+ import torch
++import sys  
++# check corrent path
++import os
++dir = os.path.dirname(os.path.abspath(__file__))
++sys.path.append(os.path.join(dir, "..", ".."))  
+ from diffsynth import ModelManager, WanVideoPipeline, save_video, VideoData, WanUniAnimateVideoPipeline
+ from modelscope import snapshot_download, dataset_snapshot_download
+ from PIL import Image
+@@ -16,24 +21,62 @@ import torchvision.transforms as T
+ from PIL import Image, ImageFilter
+ import  torch.nn  as nn
+ import cv2
+-import sys  
+-sys.path.append("../../")  
++from pathlib import Path
++
++import argparse
++
++REPO_ROOT = Path(__file__).resolve().parents[4]
++parser = argparse.ArgumentParser()
++parser.add_argument("--lora_path", type=str, required=True, help="Path to the composed LoRA weights.")
++parser.add_argument("--working_dir", type=str, required=True, help="Directory containing the inference inputs.")
++parser.add_argument(
++    "--wan_model_dir",
++    type=str,
++    default=str(REPO_ROOT / "models" / "wan" / "Wan2.1-I2V-14B-720P"),
++    help="Path to the prepared Wan 2.1 model snapshot.",
++)
++
++parser.add_argument("--repeat", type=int, default=1, help="Repeat the inference.")
++parser.add_argument("--num_frames", type=int, default=81, help="Output frame count; Wan expects 4n+1 frames.")
++parser.add_argument("--num_inference_steps", type=int, default=50)
++parser.add_argument("--height", type=int, default=832)
++parser.add_argument("--width", type=int, default=480)
++parser.add_argument(
++    "--num_persistent_param_in_dit",
++    type=int,
++    default=14 * 10**9,
++    help="Persistent DiT parameter count. Use 0 for a low-VRAM smoke test.",
++)
++args = parser.parse_args()
++
++if args.num_frames < 1 or args.num_frames % 4 != 1:
++    parser.error("--num_frames must be positive and satisfy num_frames % 4 == 1")
++if args.num_inference_steps < 1:
++    parser.error("--num_inference_steps must be positive")
++if args.height % 16 or args.width % 16:
++    parser.error("--height and --width must be divisible by 16")
++if args.num_persistent_param_in_dit < 0:
++    parser.error("--num_persistent_param_in_dit must be non-negative")
+ 
+ # define hight and width
+-height = 832
+-width = 480
++height = args.height
++width = args.width
+ seed = 0
+-max_frames = 81
++max_frames = args.num_frames
+ use_teacache = False
+ 
+ test_list_path= [
+     # Format: [frame_interval, reference image, driving pose sequence]
+-    [1, "data/images/WOMEN-Blouses_Shirts-id_00004955-01_4_full.jpg", "data/saved_pose/WOMEN-Blouses_Shirts-id_00004955-01_4_full"],
+-    [1, "data/images/musk.jpg", "data/saved_pose/musk"],
+-    [1, "data/images/WOMEN-Blouses_Shirts-id_00005125-03_4_full.jpg", "data/saved_pose/WOMEN-Blouses_Shirts-id_00005125-03_4_full"],
+-    [1, "data/images/IMG_20240514_104337.jpg", "data/saved_pose/IMG_20240514_104337"],
+-    [1, "data/images/10.jpg", "data/saved_pose/10"],
+-    [1, "data/images/taiyi2.jpg", "data/saved_pose/taiyi2"],
++    # [1, "data/images/WOMEN-Blouses_Shirts-id_00004955-01_4_full.jpg", "data/saved_pose/WOMEN-Blouses_Shirts-id_00004955-01_4_full"],
++    # [1, "data/images/musk.jpg", "data/saved_pose/musk"],
++    # [1, "data/images/WOMEN-Blouses_Shirts-id_00005125-03_4_full.jpg", "data/saved_pose/WOMEN-Blouses_Shirts-id_00005125-03_4_full"],
++    # [1, "data/images/IMG_20240514_104337.jpg", "data/saved_pose/IMG_20240514_104337"],
++    # [1, "data/images/wind.png", "data/saved_pose/wind"],
++    # [1, "data/images/10.jpg", "data/saved_pose/10"],
++    # [1, "data/images/taiyi2.jpg", "data/saved_pose/taiyi2"],
++    # 0d615b7d5257446b88e26580ff89f678
++    # 1ba6a13c4eb3447eb01bb95ab5cb92bb
++    [1, os.path.join(args.working_dir, "input_img_padded.png"), os.path.join(args.working_dir, "cond")],
+ ]
+ 
+ misc_size = [height,width]
+@@ -42,49 +85,43 @@ misc_size = [height,width]
+ # snapshot_download("Wan-AI/Wan2.1-I2V-14B-720P", local_dir="./Wan2.1-I2V-14B-720P")
+ 
+ # Load models
++wan_model_dir = Path(args.wan_model_dir).expanduser().resolve()
++diffusion_shards = sorted(wan_model_dir.glob("diffusion_pytorch_model-*.safetensors"))
++if not diffusion_shards:
++    raise FileNotFoundError(
++        f"No Wan diffusion shards found below {wan_model_dir}. See MODEL_PREPARATION.md."
++    )
+ model_manager = ModelManager(device="cpu")
+ model_manager.load_models(
+-    ["./Wan2.1-I2V-14B-720P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"],
++    [str(wan_model_dir / "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")],
+     torch_dtype=torch.float32, # Image Encoder is loaded with float32
+ )
++
+ model_manager.load_models(
+     [
+-        [
+-            
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00001-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00002-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00003-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00004-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00005-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00006-of-00007.safetensors",
+-            "./Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00007-of-00007.safetensors",
+-
+-        ],
+-        "./Wan2.1-I2V-14B-720P/models_t5_umt5-xxl-enc-bf16.pth",
+-        "./Wan2.1-I2V-14B-720P/Wan2.1_VAE.pth",
++        [str(path) for path in diffusion_shards],
++        str(wan_model_dir / "models_t5_umt5-xxl-enc-bf16.pth"),
++        str(wan_model_dir / "Wan2.1_VAE.pth"),
+     ],
+     torch_dtype=torch.bfloat16, # You can set `torch_dtype=torch.float8_e4m3fn` to enable FP8 quantization.
+ )
+ 
+-model_manager.load_lora_v2("./checkpoints/UniAnimate-Wan2.1-14B-Lora-12000.ckpt", lora_alpha=1.0)
++# model_manager.load_lora_v2("./checkpoints/UniAnimate-Wan2.1-14B-Lora-12000.ckpt", lora_alpha=1.0)
+ 
+ # if you use deepspeed to train UniAnimate-Wan2.1, multiple checkpoints may be need to load, use the following form:
+-# model_manager.load_lora_v2([
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00001-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00002-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00003-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00004-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00005-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00006-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00007-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00008-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00009-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00010-of-00011.safetensors",
+-#             "./models/lightning_logs/version_0/checkpoints/epoch=2-step=3.ckpt/output_dir/model-00011-of-00011.safetensors",
+-#             ], lora_alpha=1.0)
++test_model_path = Path(args.lora_path).expanduser().resolve()
++if test_model_path.is_dir():
++    lora_files = sorted(test_model_path.glob("model-*.safetensors"))
++elif test_model_path.is_file():
++    lora_files = [test_model_path]
++else:
++    raise FileNotFoundError(f"ControlHair checkpoint not found: {test_model_path}")
++if not lora_files:
++    raise FileNotFoundError(f"No composed LoRA safetensors found below {test_model_path}")
++model_manager.load_lora_v2([str(path) for path in lora_files], lora_alpha=1.0)
+ 
+ pipe = WanUniAnimateVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
+-pipe.enable_vram_management(num_persistent_param_in_dit=6*10**9) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required.
++pipe.enable_vram_management(num_persistent_param_in_dit=args.num_persistent_param_in_dit)
+ 
+ 
+ def resize(image):
+@@ -96,149 +133,156 @@ def resize(image):
+     )
+     return torch.from_numpy(np.array(image))
+ 
++count = 0
++for i in range(args.repeat):
++    seed = i
++    for path_dir_per in test_list_path:
++        sample_fps = path_dir_per[0] # frame interval for sampling
++        pose_file_path = path_dir_per[2]
++        ref_image_path = path_dir_per[1]
+ 
+-for path_dir_per in test_list_path:
+-    sample_fps = path_dir_per[0] # frame interval for sampling
+-    pose_file_path = path_dir_per[2]
+-    ref_image_path = path_dir_per[1]
+-
+-    dwpose_all = {}
+-    frames_all = {}
+-    
+-    for ii_index in sorted(os.listdir(pose_file_path)):
+-        if ii_index != "pose.jpg":
+-            dwpose_all[ii_index] = Image.open(os.path.join(pose_file_path, ii_index))
+-            frames_all[ii_index] = Image.fromarray(cv2.cvtColor(cv2.imread(ref_image_path), cv2.COLOR_BGR2RGB))
+-
+-    frames_pose_ref = Image.open(os.path.join(pose_file_path, "pose.jpg"))
+-
+-    stride = sample_fps
+-    _total_frame_num = len(frames_all)
+-    cover_frame_num = (stride * max_frames)
+-    
+-    if _total_frame_num < cover_frame_num + 1:
+-        start_frame = 0
+-        end_frame = _total_frame_num-1
+-        stride = max((_total_frame_num//max_frames),1)
+-        end_frame = min(stride*max_frames, _total_frame_num)
+-    else:
+-        start_frame = random.randint(0, _total_frame_num-cover_frame_num-1)
+-        end_frame = start_frame + cover_frame_num
+-    frame_list = []
+-    dwpose_list = []
+-
+-    random_ref_frame = frames_all[list(frames_all.keys())[0]]
+-    if random_ref_frame.mode != 'RGB':
+-        random_ref_frame = random_ref_frame.convert('RGB')
+-    random_ref_dwpose = frames_pose_ref
+-    if random_ref_dwpose.mode != 'RGB':
+-        random_ref_dwpose = random_ref_dwpose.convert('RGB')
+-    
+-    # sample pose sequence
+-    for i_index in range(start_frame, end_frame, stride):
+-        if i_index < len(frames_all):  # Check index within bounds
+-            i_key = list(frames_all.keys())[i_index]
+-            i_frame = frames_all[i_key]
+-            if i_frame.mode != 'RGB':
+-                i_frame = i_frame.convert('RGB')
+-            
+-            i_dwpose = dwpose_all[i_key]
+-            if i_dwpose.mode != 'RGB':
+-                i_dwpose = i_dwpose.convert('RGB')
+-            frame_list.append(i_frame)
+-            dwpose_list.append(i_dwpose)
+-    
+-    if (end_frame-start_frame) < max_frames:
+-        for _ in range(max_frames-(end_frame-start_frame)):
+-            i_key = list(frames_all.keys())[end_frame-1]
+-            
+-            i_frame = frames_all[i_key]
+-            if i_frame.mode != 'RGB':
+-                i_frame = i_frame.convert('RGB')
+-            i_dwpose = dwpose_all[i_key]
+-            
+-    
+-            frame_list.append(i_frame)
+-            dwpose_list.append(i_dwpose)
++        dwpose_all = {}
++        frames_all = {}
++        
++        for ii_index in sorted(os.listdir(pose_file_path)):
++            if ii_index != "pose.png":
++                dwpose_all[ii_index] = Image.open(os.path.join(pose_file_path, ii_index))
++                frames_all[ii_index] = Image.fromarray(cv2.cvtColor(cv2.imread(ref_image_path), cv2.COLOR_BGR2RGB))
+ 
+-    have_frames = len(frame_list)>0
+-    middle_indix = 0
++        frames_pose_ref = Image.open(os.path.join(pose_file_path, "pose.png"))
++        
++        # frames_pose_ref = Image.open(os.path.join(pose_file_path, "pose.jpg"))
+ 
+-    if have_frames:
++        stride = sample_fps
++        _total_frame_num = len(frames_all)
++        cover_frame_num = (stride * max_frames)
++        
++        if _total_frame_num < cover_frame_num + 1:
++            start_frame = 0
++            end_frame = _total_frame_num-1
++            stride = max((_total_frame_num//max_frames),1)
++            end_frame = min(stride*max_frames, _total_frame_num)
++        else:
++            # start_frame = random.randint(0, _total_frame_num-cover_frame_num-1)
++            start_frame = 0
++            end_frame = start_frame + cover_frame_num
++        frame_list = []
++        dwpose_list = []
+ 
+-        l_hight = random_ref_frame.size[1]
+-        l_width = random_ref_frame.size[0]
++        random_ref_frame = frames_all[list(frames_all.keys())[0]]
++        if random_ref_frame.mode != 'RGB':
++            random_ref_frame = random_ref_frame.convert('RGB')
++        random_ref_dwpose = frames_pose_ref
++        if random_ref_dwpose.mode != 'RGB':
++            random_ref_dwpose = random_ref_dwpose.convert('RGB')
+         
+-        ref_frame = random_ref_frame 
++        # sample pose sequence
++        for i_index in range(start_frame, end_frame, stride):
++            if i_index < len(frames_all):  # Check index within bounds
++                i_key = list(frames_all.keys())[i_index]
++                i_frame = frames_all[i_key]
++                if i_frame.mode != 'RGB':
++                    i_frame = i_frame.convert('RGB')
++                
++                i_dwpose = dwpose_all[i_key]
++                if i_dwpose.mode != 'RGB':
++                    i_dwpose = i_dwpose.convert('RGB')
++                frame_list.append(i_frame)
++                dwpose_list.append(i_dwpose)
+         
+-        random_ref_frame_tmp = torchvision.transforms.functional.resize(
+-            random_ref_frame,
+-            (height, width),
+-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+-        )
+-        random_ref_dwpose_tmp = resize(random_ref_dwpose) 
++        if (end_frame-start_frame) < max_frames:
++            for _ in range(max_frames-(end_frame-start_frame)):
++                i_key = list(frames_all.keys())[end_frame-1]
++                
++                i_frame = frames_all[i_key]
++                if i_frame.mode != 'RGB':
++                    i_frame = i_frame.convert('RGB')
++                i_dwpose = dwpose_all[i_key]
++                
+         
+-        dwpose_data_tmp = torch.stack([resize(ss).permute(2,0,1) for ss in dwpose_list], dim=0)
++                frame_list.append(i_frame)
++                dwpose_list.append(i_dwpose)
+ 
+-    
+-    dwpose_data = torch.zeros(max_frames, 3, misc_size[0], misc_size[1])
++        have_frames = len(frame_list)>0
++        middle_indix = 0
++
++        if have_frames:
++
++            l_hight = random_ref_frame.size[1]
++            l_width = random_ref_frame.size[0]
++            
++            ref_frame = random_ref_frame 
++            
++            random_ref_frame_tmp = torchvision.transforms.functional.resize(
++                random_ref_frame,
++                (height, width),
++                interpolation=torchvision.transforms.InterpolationMode.BILINEAR
++            )
++            random_ref_dwpose_tmp = resize(random_ref_dwpose) 
++            
++            dwpose_data_tmp = torch.stack([resize(ss).permute(2,0,1) for ss in dwpose_list], dim=0)
+ 
+-    if have_frames:
+-        
+-        dwpose_data[:len(frame_list), ...] = dwpose_data_tmp
+         
+-    
+-    dwpose_data = dwpose_data.permute(1,0,2,3)
+-
+-    def image_compose_width(imag, imag_1):
+-        # read the size of image1
+-        rom_image = imag
+-        width, height = imag.size
+-        # read the size of image2
+-        rom_image_1 = imag_1
++        dwpose_data = torch.zeros(max_frames, 3, misc_size[0], misc_size[1])
++
++        if have_frames:
++            
++            dwpose_data[:len(frame_list), ...] = dwpose_data_tmp
++            
+         
+-        width1 = rom_image_1.size[0]
+-        # create a new image
+-        to_image = Image.new('RGB', (width+width1, height))
+-        # paste old images
+-        to_image.paste(rom_image, (0, 0))
+-        to_image.paste(rom_image_1, (width, 0))
+-        return to_image
+-
+-    caption = "a person is dancing"
+-    video_out_condition = []
+-    for ii in range(dwpose_data_tmp.shape[0]):
+-        ss = dwpose_list[ii]
+-        video_out_condition.append(image_compose_width(random_ref_frame_tmp, torchvision.transforms.functional.resize(
+-            ss,
+-            (height, width),
+-            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+-        )))
+-
+-    # Image-to-video
+-    video = pipe(
+-        prompt="a person is dancing",
+-        negative_prompt="细节模糊不清，字幕，作品，画作，画面，静止，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，杂乱的背景，三条腿，背景人很多，倒着走",
+-        input_image=ref_frame,
+-        num_inference_steps=50,
+-        cfg_scale=1.5, # slow
+-        # cfg_scale=1.0, # fast
+-        seed=seed, tiled=True,
+-        dwpose_data=dwpose_data,
+-        random_ref_dwpose=random_ref_dwpose_tmp,
+-        height=height,
+-        width=width,
+-        tea_cache_l1_thresh=0.3 if use_teacache else None,
+-        tea_cache_model_id="Wan2.1-I2V-14B-720P" if use_teacache else None,
++        dwpose_data = dwpose_data.permute(1,0,2,3)
+ 
+-    )
++        def image_compose_width(imag, imag_1):
++            # read the size of image1
++            rom_image = imag
++            width, height = imag.size
++            # read the size of image2
++            rom_image_1 = imag_1
++            
++            width1 = rom_image_1.size[0]
++            # create a new image
++            to_image = Image.new('RGB', (width+width1, height))
++            # paste old images
++            to_image.paste(rom_image, (0, 0))
++            to_image.paste(rom_image_1, (width, 0))
++            return to_image
++         # "A person, possibly with hair that moves physically affected by wind or motion."
++        caption = "One or more people whose hair moves naturally due to wind or motion, while their facial identity is strictly preserved across video sequences."
++        video_out_condition = []
++        for ii in range(dwpose_data_tmp.shape[0]):
++            ss = dwpose_list[ii]
++            video_out_condition.append(image_compose_width(random_ref_frame_tmp, torchvision.transforms.functional.resize(
++                ss,
++                (height, width),
++                interpolation=torchvision.transforms.InterpolationMode.BILINEAR
++            )))
+ 
+-    video_out = []
+-    for ii in range(len(video)):
+-        ss = video[ii]
+-        video_out.append(image_compose_width(video_out_condition[ii], ss))
+-    os.makedirs("./outputs", exist_ok=True)
+-    save_video(video_out, "outputs/video_480P_{}_{}.mp4".format(ref_image_path.split('/')[-1], pose_file_path.split('/')[-1]), fps=15, quality=5)
++        # Image-to-video
++        video = pipe(
++            prompt="One or more people whose hair moves naturally due to wind or motion, while their facial identity is strictly preserved across video sequences.",
++            negative_prompt="细节模糊不清，字幕，作品，画作，画面，静止，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，杂乱的背景，三条腿，背景人很多，倒着走",
++            input_image=ref_frame,
++            num_inference_steps=args.num_inference_steps,
++            cfg_scale=1.5, # slow
++            # cfg_scale=1.0, # fast
++            seed=seed, tiled=True,
++            dwpose_data=dwpose_data,
++            random_ref_dwpose=random_ref_dwpose_tmp,
++            num_frames=max_frames,
++            height=height,
++            width=width,
++            tea_cache_l1_thresh=0.3 if use_teacache else None,
++            tea_cache_model_id="Wan2.1-I2V-14B-720P" if use_teacache else None,
+ 
++        )
++
++        video_out = []
++        for ii in range(len(video)):
++            ss = video[ii]
++            video_out.append(image_compose_width(video_out_condition[ii], ss))
++        # os.makedirs("./outputs_tests_ours_blender", exist_ok=True)
++        
++        save_video(video_out, os.path.join(args.working_dir, f"wan_480P_trial_{i}.mp4"), fps=15, quality=5)
++        count += 1
+ 
+-    # CUDA_VISIBLE_DEVICES="0" python examples/unianimate_wan/inference_unianimate_wan_480p.py
+\ No newline at end of file
++    # CUDA_VISIBLE_DEVICES="0" python examples/unianimate_wan/inference_unianimate_wan_480p.py
+diff --git a/examples/unianimate_wan/train_unianimate_wan.py b/examples/unianimate_wan/train_unianimate_wan.py
+index 02dffc51e7fa380fccd8348bcb5164f503d25f1b..cb0e27133c3d37c492de575c1e0642b200771738 100644
+--- a/examples/unianimate_wan/train_unianimate_wan.py
++++ b/examples/unianimate_wan/train_unianimate_wan.py
+@@ -3,6 +3,13 @@ from torchvision.transforms import v2
+ from einops import rearrange
+ import lightning as pl
+ import pandas as pd
++
++import sys  
++# check corrent path
++import os
++dir = os.path.dirname(os.path.abspath(__file__))
++sys.path.append(os.path.join(dir, "..", ".."))  
++
+ from diffsynth import WanVideoPipeline, ModelManager, load_state_dict, load_state_dict_from_folder
+ from peft import LoraConfig, inject_adapter_in_model
+ import torchvision
+@@ -18,6 +25,37 @@ import  torch.nn  as nn
+ os.environ["TOKENIZERS_PARALLELISM"] = "false"
+ 
+ 
++def load_training_frames(path_dir, pickle_name, video_name):
++    pickle_path = os.path.join(path_dir, pickle_name)
++    if os.path.isfile(pickle_path):
++        with open(pickle_path, "rb") as handle:
++            return pickle.load(handle)
++
++    video_path = os.path.join(path_dir, video_name)
++    if not os.path.isfile(video_path):
++        raise FileNotFoundError(
++            f"Missing both {pickle_name} and {video_name} in {path_dir}"
++        )
++    reader = imageio.get_reader(video_path)
++    try:
++        frames = {
++            f"{index:06d}": np.asarray(frame)
++            for index, frame in enumerate(reader)
++        }
++    finally:
++        reader.close()
++    if not frames:
++        raise RuntimeError(f"No frames decoded from {video_path}")
++    return frames
++
++
++def frame_to_pil(frame):
++    if isinstance(frame, (bytes, bytearray, memoryview)):
++        with Image.open(BytesIO(frame)) as image:
++            return image.convert("RGB").copy()
++    return Image.fromarray(np.asarray(frame)).convert("RGB")
++
++
+ 
+ class TextVideoDataset(torch.utils.data.Dataset):
+     def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
+@@ -149,7 +187,7 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+         self.steps_per_epoch = steps_per_epoch
+         
+         # data_list = ['UBC_Fashion', 'self_collected_videos_pose', 'TikTok']
+-        data_list = ['TikTok']
++        data_list = ['self_collected_videos_pose']
+         self.sample_fps = frame_interval
+         self.max_frames = max_num_frames
+         self.misc_size = [height, width]
+@@ -181,15 +219,39 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+             print("!!! dataset length: ", len(self.video_list))
+         if 'self_collected_videos_pose' in data_list:
+             
+-            self.pose_dir = "path_of_your_self_data"
+-            file_list = os.listdir(self.pose_dir)
+-            print("!!! all dataset length (self_collected_videos_pose): ", len(file_list))
+-            # 
+-            for iii_index in file_list:
+-                
+-                self.video_list.append(self.pose_dir+iii_index)
++            # Support multiple pose directories
++            self.pose_dirs = [
++                base_path,
++                # "../private_videos_face_det_static_hq_meta_mp_480p_drop_head/"
++            ]
+ 
++            self.video_list = []  # Make sure this is initialized
+             self.use_pose = True
++
++            all_files = []
++
++            for pose_dir in self.pose_dirs:
++                file_list = os.listdir(pose_dir)
++                valid_samples = 0
++                for iii_index in file_list:
++                    sample_dir = os.path.join(pose_dir, iii_index)
++                    has_packed = (
++                        os.path.isfile(os.path.join(sample_dir, "frame.pkl"))
++                        and os.path.isfile(os.path.join(sample_dir, "cond.pkl"))
++                    )
++                    has_videos = (
++                        os.path.isfile(os.path.join(sample_dir, "clip_001.mp4"))
++                        and os.path.isfile(os.path.join(sample_dir, "condition.mp4"))
++                    )
++                    if has_packed or has_videos:
++                        self.video_list.append(sample_dir)
++                        all_files.append(iii_index)
++                        valid_samples += 1
++                print(f"!!! Loaded {valid_samples} valid samples from: {pose_dir}")
++
++            if not self.video_list:
++                raise RuntimeError(f"No valid training samples found below {base_path}")
++
+             print("!!! dataset length: ", len(self.video_list))
+ 
+         random.shuffle(self.video_list)
+@@ -286,14 +348,17 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+                 clean = True
+                 path_dir = self.video_list[index]
+ 
+-                frames_all = pickle.load(open(path_dir+'/frame_data.pkl','rb'))
+-                
+-                dwpose_all = pickle.load(open(path_dir+'/dw_pose_with_foot_wo_face.pkl','rb'))
++                frames_all = load_training_frames(
++                    path_dir, "frame.pkl", "clip_001.mp4"
++                )
++                dwpose_all = load_training_frames(
++                    path_dir, "cond.pkl", "condition.mp4"
++                )
+                 # 
+                 # random sample fps
+                 stride = random.randint(1, self.sample_fps)  
+                 
+-                _total_frame_num = len(frames_all)
++                _total_frame_num = min(len(frames_all), len(dwpose_all))
+                 cover_frame_num = (stride * self.max_frames)
+                 max_frames = self.max_frames
+                 if _total_frame_num < cover_frame_num + 1:
+@@ -302,25 +367,27 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+                     stride = max((_total_frame_num//max_frames),1)
+                     end_frame = min(stride*max_frames, _total_frame_num-1)
+                 else:
+-                    start_frame = random.randint(0, _total_frame_num-cover_frame_num-5)
++                    start_frame = random.randint(0, max(0, _total_frame_num-cover_frame_num-5))
+                     end_frame = start_frame + cover_frame_num
+                 frame_list = []
+                 dwpose_list = []
+ 
+                 random_ref = random.randint(0,_total_frame_num-1)
+                 i_key = list(frames_all.keys())[random_ref]
+-                random_ref_frame = Image.open(BytesIO(frames_all[i_key]))
++                p_key = list(dwpose_all.keys())[random_ref]
++                random_ref_frame = frame_to_pil(frames_all[i_key])
+                 if random_ref_frame.mode != 'RGB':
+                     random_ref_frame = random_ref_frame.convert('RGB')
+-                random_ref_dwpose = Image.open(BytesIO(dwpose_all[i_key]))
++                random_ref_dwpose = frame_to_pil(dwpose_all[p_key])
+                 
+                 first_frame = None
+                 for i_index in range(start_frame, end_frame, stride):
+                     i_key = list(frames_all.keys())[i_index]
+-                    i_frame = Image.open(BytesIO(frames_all[i_key]))
++                    p_key = list(dwpose_all.keys())[i_index]
++                    i_frame = frame_to_pil(frames_all[i_key])
+                     if i_frame.mode != 'RGB':
+                         i_frame = i_frame.convert('RGB')
+-                    i_dwpose = Image.open(BytesIO(dwpose_all[i_key]))
++                    i_dwpose = frame_to_pil(dwpose_all[p_key])
+                     
+                     if first_frame is None:
+                         first_frame=i_frame
+@@ -335,11 +402,11 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+                 if (end_frame-start_frame) < max_frames:
+                     for _ in range(max_frames-(end_frame-start_frame)):
+                         i_key = list(frames_all.keys())[end_frame-1]
+-                        
+-                        i_frame = Image.open(BytesIO(frames_all[i_key]))
++                        p_key = list(dwpose_all.keys())[end_frame-1]
++                        i_frame = frame_to_pil(frames_all[i_key])
+                         if i_frame.mode != 'RGB':
+                             i_frame = i_frame.convert('RGB')
+-                        i_dwpose = Image.open(BytesIO(dwpose_all[i_key]))
++                        i_dwpose = frame_to_pil(dwpose_all[p_key])
+                         
+                         frame_list.append(i_frame)
+                         dwpose_list.append(i_dwpose)
+@@ -380,11 +447,11 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
+                 video_data = video_data.permute(1,0,2,3)
+                 dwpose_data = dwpose_data.permute(1,0,2,3)
+                 
+-                caption = "a person is dancing"
++                caption = "One or more people whose hair moves naturally due to wind or motion, while their facial identity is strictly preserved across video sequences."
+                 break
+             except Exception as e:
+                 # 
+-                caption = "a person is dancing"
++                caption = "One or more people whose hair moves naturally due to wind or motion, while their facial identity is strictly preserved across video sequences."
+                 # 
+                 video_data = torch.zeros(3, self.max_frames, self.misc_size[0], self.misc_size[1])  
+                 random_ref_frame_tmp = torch.zeros(self.misc_size[0], self.misc_size[1], 3)
+@@ -694,7 +761,7 @@ def parse_args():
+     parser.add_argument(
+         "--text_encoder_path",
+         type=str,
+-        default="/mnt/data/hnqiu/wanx2.1_t2v/WanX2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth",
++        default="./Wan2.1-I2V-14B-720P/models_t5_umt5-xxl-enc-bf16.pth",
+         help="Path of text encoder.",
+     )
+     parser.add_argument(
+@@ -706,7 +773,7 @@ def parse_args():
+     parser.add_argument(
+         "--vae_path",
+         type=str,
+-        default="/mnt/data/hnqiu/wanx2.1_t2v/WanX2.1-T2V-14B/WanX2.1_VAE.pth",
++        default="./Wan2.1-I2V-14B-720P/Wan2.1_VAE.pth",
+         help="Path of VAE.",
+     )
+     parser.add_argument(
+@@ -806,6 +873,12 @@ def parse_args():
+         default=1,
+         help="Number of epochs.",
+     )
++    parser.add_argument(
++        "--max_steps",
++        type=int,
++        default=10000,
++        help="Maximum number of optimizer steps.",
++    )
+     parser.add_argument(
+         "--lora_target_modules",
+         type=str,
+@@ -997,6 +1070,7 @@ def train(args):
+         logger = None
+     trainer = pl.Trainer(
+         max_epochs=args.max_epochs,
++        max_steps=args.max_steps,
+         accelerator="gpu",
+         devices="auto",
+         precision="bf16",
+@@ -1068,13 +1142,14 @@ def train_onestage(args):
+         logger = None
+     trainer = pl.Trainer(
+         max_epochs=args.max_epochs,
++        max_steps=args.max_steps,
+         accelerator="gpu",
+         devices="auto",
+         precision="bf16",
+         strategy=args.training_strategy,
+         default_root_dir=args.output_path,
+         accumulate_grad_batches=args.accumulate_grad_batches,
+-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1, every_n_train_steps=100)], # save checkpoints every_n_train_steps 
++        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1, every_n_train_steps=1000)], # save checkpoints every_n_train_steps 
+         logger=logger,
+     )
+     trainer.fit(model, dataloader)
+@@ -1086,10 +1161,3 @@ if __name__ == '__main__':
+     elif args.task == "train":
+         # support VAE and DiT in a single stage
+         train_onestage(args)
+-
+-
+-
+-# lora finetune
+-# CUDA_VISIBLE_DEVICES="0" python examples/unianimate_wan/train_unianimate_wan.py   --task train   --train_architecture lora --lora_rank 64 --lora_alpha 64  --dataset_path data/example_dataset   --output_path ./models_out_one_GPU   --dit_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00001-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00002-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00003-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00004-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00005-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00006-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00007-of-00007.safetensors"    --max_epochs 10   --learning_rate 1e-4   --accumulate_grad_batches 1   --use_gradient_checkpointing --image_encoder_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"  --use_gradient_checkpointing_offload 
+-# CUDA_VISIBLE_DEVICES="0,1" python examples/unianimate_wan/train_unianimate_wan.py  --task train   --train_architecture lora --lora_rank 128 --lora_alpha 128  --dataset_path data/example_dataset   --output_path ./models_out   --dit_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00001-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00002-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00003-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00004-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00005-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00006-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00007-of-00007.safetensors"     --max_epochs 10   --learning_rate 1e-4   --accumulate_grad_batches 1   --use_gradient_checkpointing --image_encoder_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" --use_gradient_checkpointing_offload --training_strategy "deepspeed_stage_2" 
+-# CUDA_VISIBLE_DEVICES="0,1,2,3" python examples/unianimate_wan/train_unianimate_wan.py  --task train   --train_architecture lora --lora_rank 128 --lora_alpha 128  --dataset_path data/example_dataset   --output_path ./models_out   --dit_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00001-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00002-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00003-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00004-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00005-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00006-of-00007.safetensors,/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/diffusion_pytorch_model-00007-of-00007.safetensors"     --max_epochs 10   --learning_rate 1e-4   --accumulate_grad_batches 1   --use_gradient_checkpointing --image_encoder_path "/mnt/user/VideoGeneration_Baselines/Wan2.1/Wan2.1-I2V-14B-720P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" --use_gradient_checkpointing_offload --training_strategy "deepspeed_stage_2" 
+diff --git a/setup.py b/setup.py
+index d2a429f7cb470590ca1b1ccf02ae561e1929762b..8fe046b94b8a086f26ab6f8b8d4f0364539451d9 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,6 +1,5 @@
+ import os
+ from setuptools import setup, find_packages
+-import pkg_resources
+ 
+ # Path to the requirements file
+ requirements_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+@@ -8,7 +7,11 @@ requirements_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+ # Read the requirements from the requirements file
+ if os.path.exists(requirements_path):
+     with open(requirements_path, 'r') as f:
+-        install_requires = [str(r) for r in pkg_resources.parse_requirements(f)]
++        install_requires = [
++            line.strip()
++            for line in f
++            if line.strip() and not line.lstrip().startswith('#')
++        ]
+ else:
+     install_requires = []
+ 
+
